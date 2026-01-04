@@ -1,10 +1,11 @@
-﻿using System.Data.Common;
+﻿using System.Collections.Concurrent;
+using System.Data.Common;
 
 namespace MS_AnyBaseLibNext_Shared.Bases
 {
     internal static class Common
     {
-        public static void ExecuteQuery(DbConnection? conn, List<QueryObject> ImportantQueries, List<QueryObject> CommonQueries)
+        public static async Task ExecuteQuery(DbConnection? conn, ConcurrentQueue<QueryObject> ImportantQueries, ConcurrentQueue<QueryObject> CommonQueries)
         {
             if (conn == null)
             {
@@ -12,59 +13,44 @@ namespace MS_AnyBaseLibNext_Shared.Bases
                 return;
             }
 
-            List<QueryObject> ImportantQueriesDublicate = [.. ImportantQueries];
-            ImportantQueries.Clear();
-            List<QueryObject> CommonQueriesDublicate = [.. CommonQueries];
-            CommonQueries.Clear();
+            var batch = new List<QueryObject>();
+            while (ImportantQueries.TryDequeue(out var qo)) batch.Add(qo);
+            while (CommonQueries.TryDequeue(out var qo)) batch.Add(qo);
 
-            foreach (var iq in ImportantQueriesDublicate)
-            {
-                var t = Task.Run(async () => QueryAsync(conn, iq));
-                t.Wait();
-            }
+            foreach (var qo in batch) await QueryAsync(conn, qo);
 
-            foreach (var cq in CommonQueriesDublicate)
-            {
-                var t = Task.Run(async () => QueryAsync(conn, cq));
-                t.Wait();
-            }
-
-            conn.Close();
+            await conn.CloseAsync();
         }
 
-        async static void QueryAsync(DbConnection conn, QueryObject qo)
+        async static Task QueryAsync(DbConnection conn, QueryObject qo)
         {
-            List<List<string?>>? list = [];
-            var sql = conn.CreateCommand();
-            sql.CommandText = qo.sQuery;
-            var query = Task.Run(async () =>
+            try
             {
-                if (qo.bNonQuery) await sql.ExecuteNonQueryAsync();
+                List<List<string?>>? list = [];
+                using var sql = conn.CreateCommand();
+                sql.CommandText = qo.sQuery;
+                if (qo.bNonQuery)
+                {
+                    await sql.ExecuteNonQueryAsync();
+                    qo.lAction?.Invoke([]);
+                }
                 else
                 {
-                    try
+                    var results = new List<List<string?>>();
+                    using var reader = await sql.ExecuteReaderAsync();
+                    while (await reader.ReadAsync())
                     {
-                        using DbDataReader reader = await sql.ExecuteReaderAsync();
+                        var row = new List<string?>();
+                        for (int i = 0; i < reader.FieldCount; i++)
                         {
-                            while (await reader.ReadAsync())
-                            {
-                                var fields = new List<string?>();
-                                for (int i = 0; i < reader.FieldCount; i++)
-                                {
-                                    if (!reader.IsDBNull(i)) fields.Add(reader.GetValue(i).ToString());
-                                    else fields.Add(null);
-                                }
-                                list.Add(fields);
-                            }
+                            row.Add(reader.IsDBNull(i) ? null : reader.GetValue(i).ToString());
                         }
+                        results.Add(row);
                     }
-                    catch { list = []; }
+                    qo.lAction?.Invoke(results);
                 }
-            });
-            query.Wait();
-            var task = new Task<List<List<string?>>?>(() => list);
-            if (qo.lAction != null) _ = task.ContinueWith(obj => qo.lAction(obj.Result));
-            task.Start();
+            }
+            catch { qo.lAction?.Invoke([]); }
         }
 
         private static string ReplaceFirst(this string text, string search, string replace)
@@ -76,16 +62,14 @@ namespace MS_AnyBaseLibNext_Shared.Bases
 
         public static string PrepareArg(string arg)
         {
-            if (arg == null) return "";
-            string[] escapes = ["\\", "'", "\"", "`", "%"];
-            var new_arg = "";
+            if (string.IsNullOrEmpty(arg)) return "";
+            var sb = new System.Text.StringBuilder(arg.Length + 5);
             foreach (var ch in arg)
             {
-                if (escapes.Contains(ch.ToString())) new_arg += "\\";
-                new_arg += ch.ToString();
+                if ("\\'\"`%".Contains(ch)) sb.Append('\\');
+                sb.Append(ch);
             }
-
-            return new_arg;
+            return sb.ToString();
         }
 
         public static string PrepareClear(string q, List<string>? args, Func<string, string>? escape_func = null)

@@ -1,15 +1,16 @@
 ﻿using Npgsql;
+using System.Collections.Concurrent;
 using System.Data;
-using System.Timers;
 
 namespace MS_AnyBaseLibNext_Shared.Bases
 {
     internal class PostgreDriver : IAnyBaseNext
     {
         private string? ConnStr;
-        private readonly List<QueryObject> ImportantQueries = [];
-        private readonly List<QueryObject> CommonQueries = [];
-        private System.Timers.Timer? aTimer;
+        private readonly ConcurrentQueue<QueryObject> ImportantQueries = [];
+        private readonly ConcurrentQueue<QueryObject> CommonQueries = [];
+        private PeriodicTimer? _timer;
+        private CancellationTokenSource? _cts;
         private ConnectionState LastState = ConnectionState.Closed;
 
         public void Set(string db_name, string db_host, string db_user = "", string db_pass = "")
@@ -17,9 +18,7 @@ namespace MS_AnyBaseLibNext_Shared.Bases
             UnSet();
             var db_host_arr = db_host.Split(":");
             var db_server = db_host_arr[0];
-            int db_port = 3306;
-            if (db_host_arr.Length > 1)
-                db_port = int.Parse(db_host_arr[1]);
+            int db_port = db_host_arr.Length > 1 ? int.Parse(db_host_arr[1]) : 5432;
 
             ConnStr = new NpgsqlConnectionStringBuilder
             {
@@ -32,65 +31,44 @@ namespace MS_AnyBaseLibNext_Shared.Bases
 
             }.ConnectionString;
 
-            aTimer = new System.Timers.Timer(1000);
-            aTimer.Elapsed += OnTimedEvent;
-            aTimer.AutoReset = true;
-            aTimer.Enabled = true;
+            _cts = new CancellationTokenSource();
+            _timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+            _ = OnTimedEvent(_cts.Token);
         }
 
         public void UnSet()
         {
-            aTimer?.Stop();
-            aTimer?.Dispose();
+            _cts?.Cancel();
+            _timer?.Dispose();
             ImportantQueries.Clear();
             CommonQueries.Clear();
         }
 
         public void QueryAsync(string q, List<string>? args, Action<List<List<string?>>?>? action = null, bool non_query = false, bool important = false)
         {
-            if (important) ImportantQueries.Add(new QueryObject(Common.PrepareClear(q, args), action, non_query));
-            else CommonQueries.Add(new QueryObject(Common.PrepareClear(q, args), action, non_query));
+            var qo = new QueryObject(Common.PrepareClear(q, args), action, non_query);
+            if (important) ImportantQueries.Enqueue(qo);
+            else CommonQueries.Enqueue(qo);
         }
 
-        public ConnectionState GetLastState()
-        {
-            return LastState;
-        }
+        public ConnectionState GetLastState() => LastState;
 
-        private async Task<NpgsqlConnection?> CreateConnection()
+        private async Task OnTimedEvent(CancellationToken ct)
         {
-            if (string.IsNullOrWhiteSpace(ConnStr)) return null;
-
-            try
+            while (await _timer!.WaitForNextTickAsync(ct))
             {
-                var conn = new NpgsqlConnection(ConnStr);
-                await conn.OpenAsync();
-                return conn;
+                //if (ImportantQueries.IsEmpty && CommonQueries.IsEmpty) continue;
+
+                try
+                {
+                    using var conn = new NpgsqlConnection(ConnStr);
+                    await conn.OpenAsync(ct);
+                    LastState = conn.State;
+
+                    await Common.ExecuteQuery(conn, ImportantQueries, CommonQueries);
+                }
+                catch { LastState = ConnectionState.Broken; }
             }
-            catch { return null; }
-        }
-
-        private async Task<NpgsqlConnection?> GetConnection()
-        {
-            var conn = await CreateConnection();
-            int wait_opened = 10;
-            while (wait_opened > 0)
-            {
-                if (conn != null && conn.State == ConnectionState.Open) break;
-                wait_opened--;
-                conn?.Close();
-                conn = await CreateConnection();
-                Task.Delay(150).Wait();
-            }
-            LastState = conn != null ? conn.State : ConnectionState.Closed;
-            if (wait_opened == 0) return null;
-
-            return conn;
-        }
-
-        private async void OnTimedEvent(object? sender, ElapsedEventArgs e)
-        {
-            Common.ExecuteQuery(await GetConnection(), ImportantQueries, CommonQueries);
         }
     }
 }
