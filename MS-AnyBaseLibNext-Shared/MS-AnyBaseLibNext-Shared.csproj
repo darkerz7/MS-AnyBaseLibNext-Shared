@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>ModSharp.AnyBaseLibNext.Shared</PackageId>
-    <Version>1.0.2</Version>
+    <Version>1.0.4</Version>
     <Authors>NickFox007, DarkerZ [RUS]</Authors>
     <Description>Just an easy-connecting database api for SQLite/MySQL/PostgreSQL. CS# port for ModSharp. Based on: https://github.com/NickFox007/AnyBaseLibCS2</Description>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>

@@ -1,77 +1,119 @@
 ﻿using MySqlConnector;
-using System.Collections.Concurrent;
 using System.Data;
+using System.Threading.Channels;
 
 namespace MS_AnyBaseLibNext_Shared.Bases
 {
     internal class MySQLDriver : IAnyBaseNext
     {
         private string? ConnStr;
-        private readonly ConcurrentQueue<QueryObject> ImportantQueries = [];
-        private readonly ConcurrentQueue<QueryObject> CommonQueries = [];
-        private PeriodicTimer? _timer;
+        private readonly Channel<QueryObject> ImportantQueries;
+        private readonly Channel<QueryObject> CommonQueries;
         private CancellationTokenSource? _cts;
-        private ConnectionState LastState = ConnectionState.Closed;
+        private Task? _workerTask;
+        private readonly Lock _lockObj = new();
+        private volatile ConnectionState LastState = ConnectionState.Closed;
+
+        public MySQLDriver()
+        {
+            ImportantQueries = Channel.CreateBounded<QueryObject>(new BoundedChannelOptions(CAnyBaseNext.DEFINES.MaxImportant) { FullMode = BoundedChannelFullMode.DropWrite });
+            CommonQueries = Channel.CreateBounded<QueryObject>(new BoundedChannelOptions(CAnyBaseNext.DEFINES.MaxCommon) { FullMode = BoundedChannelFullMode.DropWrite });
+        }
 
         public void Set(string db_name, string db_host, string db_user = "", string db_pass = "")
         {
-            UnSet();
-            var db_host_arr = db_host.Split(":");
-            var db_server = db_host_arr[0];
-            uint db_port = db_host_arr.Length > 1 ? uint.Parse(db_host_arr[1]) : 3306;
-
-            ConnStr = new MySqlConnectionStringBuilder
+            lock (_lockObj)
             {
-                Server = db_server,
-                Database = db_name,
-                UserID = db_user,
-                Password = db_pass,
-                SslMode = MySqlSslMode.None,
-                Port = db_port,
-                AllowPublicKeyRetrieval = true,
-                Pooling = true
+                UnSet();
+                string db_server = db_host;
+                uint db_port = 3306;
 
-            }.ConnectionString;
+                if (db_host.Contains(':'))
+                {
+                    var prefix = db_host.Contains("://") ? "" : "mysql://";
+                    if (Uri.TryCreate(prefix + db_host, UriKind.Absolute, out var uri))
+                    {
+                        db_server = uri.Host;
+                        db_port = uri.Port <= 0 ? 3306 : (uint)uri.Port;
+                    }
+                }
 
-            _cts = new CancellationTokenSource();
-            _timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
-            _ = OnTimedEvent(_cts.Token);
+                ConnStr = new MySqlConnectionStringBuilder
+                {
+                    Server = db_server,
+                    Database = db_name,
+                    UserID = db_user,
+                    Password = db_pass,
+                    SslMode = MySqlSslMode.Preferred,
+                    Port = db_port,
+                    AllowPublicKeyRetrieval = true,
+                    Pooling = true,
+                    MinimumPoolSize = 1,
+                    MaximumPoolSize = 50
+
+                }.ConnectionString;
+
+                _cts = new CancellationTokenSource();
+                _workerTask = WorkerLoop(_cts.Token);
+            }
         }
 
         public void UnSet()
         {
-            _cts?.Cancel();
-            _timer?.Dispose();
-            ImportantQueries.Clear();
-            CommonQueries.Clear();
+            lock (_lockObj)
+            {
+                if (_cts != null)
+                {
+                    _cts.Cancel();
+                    try { _workerTask?.Wait(1000); } catch { }
+                    _cts.Dispose();
+                    _cts = null;
+                    _workerTask = null;
+                }
+                LastState = ConnectionState.Closed;
+            }
         }
 
         public void QueryAsync(string q, List<string>? args, Action<List<List<string?>>?>? action = null, bool non_query = false, bool important = false)
         {
-            var qo = new QueryObject(Common.PrepareClear(q, args), action, non_query);
-            if (important) ImportantQueries.Enqueue(qo);
-            else CommonQueries.Enqueue(qo);
+            var qo = new QueryObject(Common.RemoveTypeCasts(q), args, action, non_query);
+            var channel = important ? ImportantQueries.Writer : CommonQueries.Writer;
+            if (!channel.TryWrite(qo)) Common.SafeInvoke(qo, null);
         }
 
         public ConnectionState GetLastState() => LastState;
 
-        private async Task OnTimedEvent(CancellationToken ct)
+        private async Task WorkerLoop(CancellationToken ct)
         {
-            while (await _timer!.WaitForNextTickAsync(ct))
+            while (!ct.IsCancellationRequested)
             {
-                //if (ImportantQueries.IsEmpty && CommonQueries.IsEmpty) continue;
-
                 try
                 {
-                    using var conn = new MySqlConnection(ConnStr);
-                    await conn.OpenAsync(ct);
+                    await Task.Delay(CAnyBaseNext.DEFINES.DelayQueries, ct);
 
+                    if (string.IsNullOrEmpty(ConnStr)) continue;
+                    using var conn = new MySqlConnection(ConnStr);
+
+                    await conn.OpenAsync(ct);
                     LastState = conn.State;
 
-                    await Common.ExecuteQuery(conn, ImportantQueries, CommonQueries);
+                    await Common.ExecuteQuery(conn, ImportantQueries.Reader, CommonQueries.Reader, ct);
+
+                    if (conn.State != ConnectionState.Open) throw new Exception("Connection lost during query execution");
+
+                    LastState = conn.State;
                 }
-                catch (Exception) { LastState = ConnectionState.Broken; }
+                catch (OperationCanceledException) { break; }
+                catch (Exception)
+                {
+                    LastState = ConnectionState.Broken;
+                    Common.ClearQueries(CommonQueries.Reader);
+
+                    try { await Task.Delay(CAnyBaseNext.DEFINES.TimeOut, ct); }
+                    catch (OperationCanceledException) { break; }
+                }
             }
+            LastState = ConnectionState.Closed;
         }
     }
 }

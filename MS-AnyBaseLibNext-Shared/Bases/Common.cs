@@ -1,99 +1,146 @@
-﻿using System.Collections.Concurrent;
+﻿using System.Data;
 using System.Data.Common;
+using System.Globalization;
+using System.Text.RegularExpressions;
+using System.Threading.Channels;
 
 namespace MS_AnyBaseLibNext_Shared.Bases
 {
-    internal static class Common
+    internal static partial class Common
     {
-        public static async Task ExecuteQuery(DbConnection? conn, ConcurrentQueue<QueryObject> ImportantQueries, ConcurrentQueue<QueryObject> CommonQueries)
+        public static async Task ExecuteQuery(DbConnection conn, ChannelReader<QueryObject> ImportantQueries, ChannelReader<QueryObject> CommonQueries, CancellationToken ct)
         {
-            if (conn == null)
+            int iLimitImportant = CAnyBaseNext.DEFINES.MaxImportantPerTick;
+            while (iLimitImportant-- > 0 && ImportantQueries.TryRead(out var qo))
             {
-                CommonQueries.Clear();
-                return;
+                if (ct.IsCancellationRequested) break;
+                await QueryAsync(conn, qo, ct);
+                if (conn.State != ConnectionState.Open) return;
             }
 
-            var batch = new List<QueryObject>();
-            while (ImportantQueries.TryDequeue(out var qo)) batch.Add(qo);
-            while (CommonQueries.TryDequeue(out var qo)) batch.Add(qo);
-
-            foreach (var qo in batch) await QueryAsync(conn, qo);
-
-            await conn.CloseAsync();
+            int iLimitCommon = CAnyBaseNext.DEFINES.MaxCommonPerTick;
+            while (iLimitCommon-- > 0 && CommonQueries.TryRead(out var qo))
+            {
+                if (ct.IsCancellationRequested) break;
+                await QueryAsync(conn, qo, ct);
+                if (conn.State != ConnectionState.Open) return;
+            }
         }
 
-        async static Task QueryAsync(DbConnection conn, QueryObject qo)
+        public static void ClearQueries(ChannelReader<QueryObject> channel)
+        {
+            while (channel.TryRead(out var qo)) { SafeInvoke(qo, null); }
+        }
+
+        async static Task QueryAsync(DbConnection conn, QueryObject qo, CancellationToken ct)
         {
             try
             {
-                List<List<string?>>? list = [];
                 using var sql = conn.CreateCommand();
-                sql.CommandText = qo.sQuery;
-                if (qo.bNonQuery)
+                if (PrepareQuery(sql, qo.sQuery, qo.lArgs) == QueryClearResult.Success)
                 {
-                    await sql.ExecuteNonQueryAsync();
-                    qo.lAction?.Invoke([]);
-                }
-                else
-                {
-                    var results = new List<List<string?>>();
-                    using var reader = await sql.ExecuteReaderAsync();
-                    while (await reader.ReadAsync())
+                    if (qo.bNonQuery)
                     {
-                        var row = new List<string?>();
-                        for (int i = 0; i < reader.FieldCount; i++)
-                        {
-                            row.Add(reader.IsDBNull(i) ? null : reader.GetValue(i).ToString());
-                        }
-                        results.Add(row);
+                        await sql.ExecuteNonQueryAsync(ct);
+                        SafeInvoke(qo, []);
                     }
-                    qo.lAction?.Invoke(results);
+                    else
+                    {
+                        var results = new List<List<string?>>();
+                        using var reader = await sql.ExecuteReaderAsync(CommandBehavior.SequentialAccess, ct);
+                        while (await reader.ReadAsync(ct))
+                        {
+                            int fieldCount = reader.FieldCount;
+                            var row = new List<string?>(fieldCount);
+
+                            for (int i = 0; i < fieldCount; i++)
+                            {
+                                if (await reader.IsDBNullAsync(i, ct)) row.Add(null);
+                                else
+                                {
+                                    object val = await reader.GetFieldValueAsync<object>(i, ct);
+
+                                    row.Add(val switch
+                                    {
+                                        IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
+                                        DBNull => null,
+                                        _ => val.ToString()
+                                    });
+                                }
+                            }
+                            results.Add(row);
+                        }
+                        SafeInvoke(qo, results);
+                    }
+
                 }
+                else SafeInvoke(qo, null);
             }
-            catch { qo.lAction?.Invoke([]); }
-        }
-
-        private static string ReplaceFirst(this string text, string search, string replace)
-        {
-            int pos = text.IndexOf(search);
-            if (pos < 0) return text;
-            return text[..pos] + replace + text[(pos + search.Length)..];
-        }
-
-        public static string PrepareArg(string arg)
-        {
-            if (string.IsNullOrEmpty(arg)) return "";
-            var sb = new System.Text.StringBuilder(arg.Length + 5);
-            foreach (var ch in arg)
+            catch (DbException ex) when (IsCriticalError(ex))
             {
-                if ("\\'\"`%".Contains(ch)) sb.Append('\\');
-                sb.Append(ch);
+                SafeInvoke(qo, null);
+                throw;
             }
-            return sb.ToString();
+            catch
+            {
+                SafeInvoke(qo, null);
+            }
         }
 
-        public static string PrepareClear(string q, List<string>? args, Func<string, string>? escape_func = null)
+        private static bool IsCriticalError(DbException ex) => ex.SqlState == "08S01" || ex.Message.Contains("Connection");
+
+        public static void SafeInvoke(QueryObject qo, List<List<string?>>? data)
         {
-            var new_q = q;
-            if (args != null)
-                foreach (string arg in args.ToList())
-                {
-                    var new_q2 = "";
-                    if (escape_func == null) new_q2 = ReplaceFirst(new_q, "{ARG}", PrepareArg(arg));
-                    else new_q2 = ReplaceFirst(new_q, "{ARG}", escape_func(arg));
-
-                    if (new_q2 == new_q) throw new Exception("Mailformed query [Too many args in params]");
-                    new_q = new_q2;
-                }
-            if (new_q.Contains("{ARG}")) throw new Exception("Mailformed query [Not enough args in params]");
-            return new_q;
+            if (qo.lAction == null) return;
+            _ = Task.Run(() => {
+                try { qo.lAction?.Invoke(data); }
+                catch { }
+            }, CancellationToken.None);
         }
+
+        public static QueryClearResult PrepareQuery(DbCommand sql, string q, List<string>? args)
+        {
+            int iCountArgsRegex = ARGRegex().Count(q);
+            int iCountArgs = args?.Count ?? 0;
+            if (iCountArgsRegex != iCountArgs) return iCountArgsRegex > iCountArgs ? QueryClearResult.NotEnoughArg : QueryClearResult.ManyArgs;
+
+            if (args != null && iCountArgs > 0)
+            {
+                int index = 0;
+                sql.CommandText = ARGRegex().Replace(q, m => $"@p_anybaselibnext{index++}");
+                for (int i = 0; i < iCountArgs; i++)
+                {
+                    DbParameter par = sql.CreateParameter();
+                    par.ParameterName = $"@p_anybaselibnext{i}";
+                    par.Value = (object?)args[i] ?? DBNull.Value;
+                    par.DbType = DbType.String;
+                    sql.Parameters.Add(par);
+                }
+            }
+            else sql.CommandText = q;
+            return QueryClearResult.Success;
+        }
+
+        public static string RemoveTypeCasts(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return input;
+            return TypeCasts().Replace(input, "{ARG}");
+        }
+
+        [GeneratedRegex("{ARG}")]
+        private static partial Regex ARGRegex();
+
+        [GeneratedRegex(@"(\{ARG\})(::[a-zA-Z0-9_""\[\]]+)+")]
+        private static partial Regex TypeCasts();
     }
 
-    class QueryObject(string q, Action<List<List<string?>>?>? action = null, bool non_query = false)
+    enum QueryClearResult { Success, ManyArgs, NotEnoughArg }
+
+    class QueryObject(string q, List<string>? args, Action<List<List<string?>>?>? action = null, bool non_query = false)
     {
         public readonly string sQuery = q;
-        public Action<List<List<string?>>?>? lAction = action;
+        public readonly List<string>? lArgs = args;
+        public readonly Action<List<List<string?>>?>? lAction = action;
         public readonly bool bNonQuery = non_query;
     }
 }
